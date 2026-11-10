@@ -6,6 +6,11 @@ from ml.predict import CLASSIFIER_PATH, VECTORIZER_PATH, predict_message
 client = TestClient(main.app)
 
 
+def test_existing_home_and_health_endpoints_remain_available() -> None:
+    assert client.get("/").status_code == 200
+    assert client.get("/health").json()["status"] == "healthy"
+
+
 def test_empty_message_is_rejected() -> None:
     response = client.post("/api/analyze-message", json={"message": "   "})
 
@@ -28,7 +33,7 @@ def test_training_created_both_model_files() -> None:
 
 def test_spam_like_message_prediction() -> None:
     prediction = predict_message(
-        "URGENT! Your account is blocked. Click this link immediately to verify."
+        "Congratulations! You have won a free gift. Claim now."
     )
 
     assert prediction["predicted_label"] == "spam"

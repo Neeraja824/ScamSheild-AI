@@ -3,6 +3,39 @@ import './App.css'
 
 const MAX_MESSAGE_LENGTH = 2000
 const CURRENT_YEAR = new Date().getFullYear()
+const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000')
+  .trim()
+  .replace(/\/+$/, '')
+
+type AnalyzeMessageResponse = {
+  predicted_label: 'spam' | 'legitimate'
+  risk_level: 'elevated' | 'unconfirmed'
+  model_probability: number
+  explanation: string
+  warning_signs: string[]
+  recommendations: string[]
+}
+
+function isAnalyzeMessageResponse(value: unknown): value is AnalyzeMessageResponse {
+  if (typeof value !== 'object' || value === null) {
+    return false
+  }
+
+  const response = value as Record<string, unknown>
+  return (
+    (response.predicted_label === 'spam' || response.predicted_label === 'legitimate') &&
+    (response.risk_level === 'elevated' || response.risk_level === 'unconfirmed') &&
+    typeof response.model_probability === 'number' &&
+    Number.isFinite(response.model_probability) &&
+    response.model_probability >= 0 &&
+    response.model_probability <= 1 &&
+    typeof response.explanation === 'string' &&
+    Array.isArray(response.warning_signs) &&
+    response.warning_signs.every((item) => typeof item === 'string') &&
+    Array.isArray(response.recommendations) &&
+    response.recommendations.every((item) => typeof item === 'string')
+  )
+}
 
 function ShieldIcon({ className = '' }: { className?: string }) {
   return (
@@ -123,20 +156,75 @@ function MessageIcon() {
 
 function App() {
   const [message, setMessage] = useState('')
-  const [status, setStatus] = useState('')
+  const [result, setResult] = useState<AnalyzeMessageResponse | null>(null)
+  const [error, setError] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
 
-  function handleAnalyze() {
-    setStatus(
-      message.trim()
-        ? 'AI message analysis will be available after backend integration. Your message has not been analyzed.'
-        : 'Enter a message above to get started. AI analysis will be available after backend integration.',
-    )
+  async function handleAnalyze() {
+    const submittedMessage = message.trim()
+    if (!submittedMessage) {
+      setResult(null)
+      setError('Enter a message before starting a scan.')
+      return
+    }
+
+    setResult(null)
+    setError('')
+    setIsLoading(true)
+
+    try {
+      let response: Response
+      try {
+        response = await fetch(`${API_BASE_URL}/api/analyze-message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: submittedMessage }),
+        })
+      } catch {
+        throw new Error('Could not reach the ScamShield AI backend. Check that the API is running and try again.')
+      }
+
+      let responseBody: unknown
+      try {
+        responseBody = await response.json()
+      } catch {
+        throw new Error('The backend returned an unreadable response. Please try again.')
+      }
+
+      if (!response.ok) {
+        if (response.status === 422) {
+          throw new Error('The backend could not validate this message. Check the input and try again.')
+        }
+        if (response.status === 503) {
+          throw new Error('The SMS classifier is not ready yet. Please try again later.')
+        }
+        if (response.status >= 500) {
+          throw new Error('The backend could not complete the scan. Please try again later.')
+        }
+        throw new Error('The backend could not process this request. Please try again.')
+      }
+
+      if (!isAnalyzeMessageResponse(responseBody)) {
+        throw new Error('The backend response was incomplete or unexpected. No result was displayed.')
+      }
+
+      setResult(responseBody)
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : 'An unexpected error occurred. Please try again.',
+      )
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   function handleClear() {
     setMessage('')
-    setStatus('')
+    setResult(null)
+    setError('')
   }
 
   function closeMenu() {
@@ -294,17 +382,19 @@ function App() {
                     <p>Paste the text you want to review</p>
                   </div>
                 </div>
-                <span className="privacy-label"><ShieldIcon /> Your message stays in this browser</span>
+                <span className="privacy-label"><ShieldIcon /> Sent to the configured backend</span>
               </div>
               <label className="visually-hidden" htmlFor="message-input">
                 Suspicious message to check
               </label>
               <textarea
                 id="message-input"
+                disabled={isLoading}
                 maxLength={MAX_MESSAGE_LENGTH}
                 onChange={(event) => {
                   setMessage(event.target.value)
-                  setStatus('')
+                  setResult(null)
+                  setError('')
                 }}
                 placeholder="Paste a suspicious text, email, or direct message here..."
                 value={message}
@@ -314,17 +404,95 @@ function App() {
                   {message.length} / {MAX_MESSAGE_LENGTH} characters
                 </span>
                 <div className="scanner-buttons">
-                  <button className="button button-clear" onClick={handleClear} type="button">
+                  <button
+                    className="button button-clear"
+                    disabled={isLoading}
+                    onClick={handleClear}
+                    type="button"
+                  >
                     Clear
                   </button>
-                  <button className="button button-primary analyze-button" onClick={handleAnalyze} type="button">
-                    <ScanIcon /> Analyze Message <ArrowIcon />
+                  <button
+                    aria-busy={isLoading}
+                    className="button button-primary analyze-button"
+                    disabled={isLoading}
+                    onClick={handleAnalyze}
+                    type="button"
+                  >
+                    {isLoading ? (
+                      <>
+                        <span aria-hidden="true" className="loading-spinner" />
+                        Analyzing message...
+                      </>
+                    ) : (
+                      <>
+                        <ScanIcon /> Scan Message <ArrowIcon />
+                      </>
+                    )}
                   </button>
                 </div>
               </div>
-              {status && <p className="scanner-status" role="status">{status}</p>}
+              {isLoading && <p className="scanner-status" role="status">Analyzing message...</p>}
+              {error && <p className="scanner-error" role="alert">{error}</p>}
+              {result && (
+                <section
+                  aria-labelledby="scan-result-title"
+                  aria-live="polite"
+                  className="scan-result"
+                >
+                  <div className="scan-result-header">
+                    <div>
+                      <span className="result-eyebrow">SMS SPAM CLASSIFIER</span>
+                      <h3 id="scan-result-title">Scan result</h3>
+                    </div>
+                    <span className={`risk-badge risk-${result.risk_level}`}>
+                      {result.risk_level === 'elevated' ? 'Elevated risk' : 'Unconfirmed'}
+                    </span>
+                  </div>
+                  <div className="result-summary">
+                    <span className="result-label">
+                      Predicted class: <strong>{result.predicted_label}</strong>
+                    </span>
+                    <span className="result-confidence">
+                      Model confidence: <strong>{(result.model_probability * 100).toFixed(1)}%</strong>
+                    </span>
+                  </div>
+                  <p className="result-confidence-note">
+                    Model confidence is not a guaranteed probability that this message is a scam.
+                  </p>
+                  <p className="result-explanation">{result.explanation}</p>
+                  <div className="result-details">
+                    <div>
+                      <h4>Warning signs</h4>
+                      {result.warning_signs.length > 0 ? (
+                        <ul>
+                          {result.warning_signs.map((sign, index) => (
+                            <li key={`${sign}-${index}`}>{sign}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="result-empty">
+                          No common warning signs were identified. This does not confirm the message is safe.
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <h4>Recommendations</h4>
+                      {result.recommendations.length > 0 ? (
+                        <ul>
+                          {result.recommendations.map((recommendation, index) => (
+                            <li key={`${recommendation}-${index}`}>{recommendation}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="result-empty">No recommendations were returned.</p>
+                      )}
+                    </div>
+                  </div>
+                </section>
+              )}
               <p className="scanner-disclaimer">
-                No message is sent or analyzed. Connect a backend to enable AI-powered checks.
+                Messages are sent to the ScamShield AI backend for SMS spam classification. Never submit passwords, payment details, or other sensitive information.
               </p>
             </div>
           </div>
