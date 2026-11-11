@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type FormEvent } from 'react'
 import './App.css'
 
 const MAX_MESSAGE_LENGTH = 2000
@@ -11,6 +11,14 @@ type AnalyzeMessageResponse = {
   predicted_label: 'spam' | 'legitimate'
   risk_level: 'elevated' | 'unconfirmed'
   model_probability: number
+  explanation: string
+  warning_signs: string[]
+  recommendations: string[]
+}
+
+type AnalyzeURLResponse = {
+  risk_level: 'unverified' | 'caution'
+  risk_indicators: string[]
   explanation: string
   warning_signs: string[]
   recommendations: string[]
@@ -35,6 +43,38 @@ function isAnalyzeMessageResponse(value: unknown): value is AnalyzeMessageRespon
     Array.isArray(response.recommendations) &&
     response.recommendations.every((item) => typeof item === 'string')
   )
+}
+
+function isAnalyzeURLResponse(value: unknown): value is AnalyzeURLResponse {
+  if (typeof value !== 'object' || value === null) {
+    return false
+  }
+
+  const response = value as Record<string, unknown>
+  return (
+    (response.risk_level === 'unverified' || response.risk_level === 'caution') &&
+    Array.isArray(response.risk_indicators) &&
+    response.risk_indicators.every((item) => typeof item === 'string') &&
+    typeof response.explanation === 'string' &&
+    Array.isArray(response.warning_signs) &&
+    response.warning_signs.every((item) => typeof item === 'string') &&
+    Array.isArray(response.recommendations) &&
+    response.recommendations.every((item) => typeof item === 'string')
+  )
+}
+
+function formatRiskIndicator(indicator: string): string {
+  const knownLabels: Record<string, string> = {
+    ip_address_host: 'IP address used as host',
+    excessive_subdomains: 'Several nested subdomains',
+    at_symbol_in_authority: '@ symbol in URL authority',
+    url_shortener: 'URL shortener',
+    internationalized_domain: 'Encoded internationalized domain',
+    many_hyphens: 'Several hyphens in hostname',
+    account_related_hostname: 'Account-related hostname wording',
+  }
+
+  return knownLabels[indicator] ?? indicator.replaceAll('_', ' ')
 }
 
 function ShieldIcon({ className = '' }: { className?: string }) {
@@ -159,6 +199,10 @@ function App() {
   const [result, setResult] = useState<AnalyzeMessageResponse | null>(null)
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [url, setUrl] = useState('')
+  const [urlResult, setUrlResult] = useState<AnalyzeURLResponse | null>(null)
+  const [urlError, setUrlError] = useState('')
+  const [isURLLoading, setIsURLLoading] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
 
   async function handleAnalyze() {
@@ -225,6 +269,64 @@ function App() {
     setMessage('')
     setResult(null)
     setError('')
+  }
+
+  async function handleAnalyzeURL(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const submittedURL = url.trim()
+    if (!submittedURL) {
+      setUrlResult(null)
+      setUrlError('Enter a URL before starting a scan.')
+      return
+    }
+
+    setUrlResult(null)
+    setUrlError('')
+    setIsURLLoading(true)
+
+    try {
+      let response: Response
+      try {
+        response = await fetch(`${API_BASE_URL}/api/analyze-url`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: submittedURL }),
+        })
+      } catch {
+        throw new Error('Could not reach the ScamShield AI backend. Check that the API is running and try again.')
+      }
+
+      let responseBody: unknown
+      try {
+        responseBody = await response.json()
+      } catch {
+        throw new Error('The backend returned an unreadable response. Please try again.')
+      }
+
+      if (!response.ok) {
+        if (response.status === 422) {
+          throw new Error('The URL could not be validated. Enter a valid HTTP or HTTPS URL and try again.')
+        }
+        if (response.status >= 500) {
+          throw new Error('The backend could not complete the URL scan. Please try again later.')
+        }
+        throw new Error('The backend could not process this URL. Please try again.')
+      }
+
+      if (!isAnalyzeURLResponse(responseBody)) {
+        throw new Error('The backend response was incomplete or unexpected. No result was displayed.')
+      }
+
+      setUrlResult(responseBody)
+    } catch (requestError) {
+      setUrlError(
+        requestError instanceof Error
+          ? requestError.message
+          : 'An unexpected error occurred. Please try again.',
+      )
+    } finally {
+      setIsURLLoading(false)
+    }
   }
 
   function closeMenu() {
@@ -498,6 +600,142 @@ function App() {
           </div>
         </section>
 
+        <section aria-labelledby="url-scanner-title" className="scanner-section url-scanner-section section-padding" id="url-scanner">
+          <div className="page-container">
+            <div className="section-heading scanner-heading">
+              <div>
+                <div className="eyebrow"><span className="eyebrow-dash" /> URL SCANNER</div>
+                <h2 id="url-scanner-title">Pause before you open.</h2>
+                <p>Review basic URL patterns without visiting the submitted address.</p>
+              </div>
+              <div aria-hidden="true" className="scanner-decoration"><LinkIcon /></div>
+            </div>
+
+            <div className="scanner-panel">
+              <div className="scanner-panel-top">
+                <div className="scanner-panel-title">
+                  <span className="panel-icon"><LinkIcon /></span>
+                  <div>
+                    <h3>URL check</h3>
+                    <p>Paste the web address you want to review</p>
+                  </div>
+                </div>
+                <span className="privacy-label"><ShieldIcon /> Submitted to the configured backend</span>
+              </div>
+              <form onSubmit={handleAnalyzeURL}>
+                <label className="visually-hidden" htmlFor="url-input">
+                  URL to check
+                </label>
+                <input
+                  autoComplete="url"
+                  className="url-input"
+                  disabled={isURLLoading}
+                  id="url-input"
+                  maxLength={2048}
+                  onChange={(event) => {
+                    setUrl(event.target.value)
+                    setUrlResult(null)
+                    setUrlError('')
+                  }}
+                  placeholder="https://example.com"
+                  spellCheck={false}
+                  type="text"
+                  value={url}
+                />
+                <div className="scanner-controls">
+                  <span className="character-count">Enter a complete HTTP or HTTPS URL</span>
+                  <div className="scanner-buttons">
+                    <button
+                      aria-busy={isURLLoading}
+                      className="button button-primary analyze-button"
+                      disabled={isURLLoading}
+                      type="submit"
+                    >
+                      {isURLLoading ? (
+                        <>
+                          <span aria-hidden="true" className="loading-spinner" />
+                          Analyzing URL...
+                        </>
+                      ) : (
+                        <>
+                          <ScanIcon /> Scan URL <ArrowIcon />
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </form>
+              {isURLLoading && <p className="scanner-status" role="status">Analyzing URL patterns...</p>}
+              {urlError && <p className="scanner-error" role="alert">{urlError}</p>}
+              {urlResult && (
+                <section
+                  aria-labelledby="url-result-title"
+                  aria-live="polite"
+                  className="scan-result"
+                >
+                  <div className="scan-result-header">
+                    <div>
+                      <span className="result-eyebrow">PATTERN-BASED URL REVIEW</span>
+                      <h3 id="url-result-title">Scan result</h3>
+                    </div>
+                    <span className={`risk-badge risk-url-${urlResult.risk_level}`}>
+                      {urlResult.risk_level === 'caution' ? 'Caution' : 'Unverified'}
+                    </span>
+                  </div>
+                  <p className="url-result-value">{url.trim()}</p>
+                  <p className="result-explanation">{urlResult.explanation}</p>
+                  <p className="result-confidence-note">
+                    Pattern-based analysis does not prove a URL is malicious or safe. Submitted URLs are not opened or visited.
+                  </p>
+                  <div className="result-details">
+                    <div>
+                      <h4>Risk indicators</h4>
+                      {urlResult.risk_indicators.length > 0 ? (
+                        <ul>
+                          {urlResult.risk_indicators.map((indicator, index) => (
+                            <li key={`${indicator}-${index}`}>{formatRiskIndicator(indicator)}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="result-empty">
+                          No checked suspicious patterns were identified. The URL remains unverified.
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <h4>Warning signs</h4>
+                      {urlResult.warning_signs.length > 0 ? (
+                        <ul>
+                          {urlResult.warning_signs.map((sign, index) => (
+                            <li key={`${sign}-${index}`}>{sign}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="result-empty">No checked warning signs were identified.</p>
+                      )}
+                    </div>
+                    <div className="url-recommendations">
+                      <h4>Recommendations</h4>
+                      {urlResult.recommendations.length > 0 ? (
+                        <ul>
+                          {urlResult.recommendations.map((recommendation, index) => (
+                            <li key={`${recommendation}-${index}`}>{recommendation}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="result-empty">No recommendations were returned.</p>
+                      )}
+                    </div>
+                  </div>
+                </section>
+              )}
+              <p className="scanner-disclaimer">
+                This basic pattern review is not a complete phishing detector. Do not treat an unverified result as proof that a URL is safe.
+              </p>
+            </div>
+          </div>
+        </section>
+
         <section aria-labelledby="features-title" className="features-section section-padding" id="about">
           <div className="page-container">
             <div className="section-heading centered-heading">
@@ -515,13 +753,13 @@ function App() {
                   Check a message <ArrowIcon />
                 </a>
               </article>
-              <article className="feature-card" id="url-scanner">
+              <article className="feature-card">
                 <div className="feature-icon feature-icon-green"><LinkIcon /></div>
                 <span className="feature-number">02</span>
-                <h3>Phishing URL Detection</h3>
-                <p>Learn to spot unexpected links and deceptive web addresses before you click.</p>
-                <a className="feature-link" href="#how-it-works">
-                  Learn how to check <ArrowIcon />
+                <h3>URL Pattern Review</h3>
+                <p>Review basic web-address patterns before deciding what to do. Results do not confirm a URL is safe or malicious.</p>
+                <a className="feature-link" href="#url-scanner">
+                  Scan a URL <ArrowIcon />
                 </a>
               </article>
               <article className="feature-card">
@@ -536,7 +774,7 @@ function App() {
             </div>
             <p className="feature-note">
               <span className="note-dot" />
-              These capabilities are product goals; automated analysis is not enabled yet.
+              Screenshot scanning is not enabled yet. URL results are limited to basic patterns and are not a safety guarantee.
             </p>
           </div>
         </section>
