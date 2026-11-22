@@ -1,8 +1,10 @@
 
 import logging
 import re
+import sqlite3
 from io import BytesIO
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,9 +12,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from ml.predict import predict_message
+from scan_history import (
+    ScanType,
+    dashboard_summary,
+    delete_all_scans,
+    get_scan,
+    initialize_database,
+    insert_scan,
+    list_scans,
+)
 from url_analysis import URLAnalysis, analyze_url, validate_http_url
 
 logger = logging.getLogger(__name__)
+
+initialize_database()
 
 app = FastAPI(
     title="ScamShield AI",
@@ -22,7 +35,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,6 +67,19 @@ class AnalyzeMessageRequest(BaseModel):
     def message_must_contain_text(cls, value: str) -> str:
         if not value:
             raise ValueError("message must not be empty or whitespace.")
+        return value
+
+
+class AnalyzeScreenshotRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    extracted_text: str = Field(min_length=1, max_length=5000)
+
+    @field_validator("extracted_text")
+    @classmethod
+    def extracted_text_must_contain_text(cls, value: str) -> str:
+        if not value:
+            raise ValueError("extracted_text must not be empty or whitespace.")
         return value
 
 
@@ -202,15 +228,9 @@ def _find_warning_signs(message: str) -> list[str]:
     return [description for pattern, description in WARNING_SIGN_RULES if pattern.search(message)]
 
 
-@app.post(
-    "/api/analyze-message",
-    response_model=AnalyzeMessageResponse,
-    summary="Classify a message with the SMS spam model",
-)
-def analyze_message(request: AnalyzeMessageRequest) -> AnalyzeMessageResponse:
-    """Classify SMS-like text; this does not verify that a message is safe."""
+def _analyze_message_text(message: str) -> AnalyzeMessageResponse:
     try:
-        prediction = predict_message(request.message)
+        prediction = predict_message(message)
     except FileNotFoundError as error:
         raise HTTPException(
             status_code=503,
@@ -230,7 +250,7 @@ def analyze_message(request: AnalyzeMessageRequest) -> AnalyzeMessageResponse:
 
     predicted_label = str(prediction["predicted_label"])
     model_probability = float(prediction["model_probability"])
-    warning_signs = _find_warning_signs(request.message)
+    warning_signs = _find_warning_signs(message)
 
     if predicted_label == "spam":
         risk_level = "elevated"
@@ -273,6 +293,72 @@ def analyze_message(request: AnalyzeMessageRequest) -> AnalyzeMessageResponse:
     )
 
 
+def _record_scan(
+    *,
+    scan_type: ScanType,
+    result: AnalyzeMessageResponse | AnalyzeURLResponse,
+    details: dict[str, int | str],
+    risk_indicators: list[str] | None = None,
+) -> None:
+    if isinstance(result, AnalyzeMessageResponse):
+        predicted_class = result.predicted_label
+        model_confidence = result.model_probability
+    else:
+        predicted_class = None
+        model_confidence = None
+
+    try:
+        insert_scan(
+            scan_type=scan_type,
+            risk_level=result.risk_level,
+            predicted_class=predicted_class,
+            model_confidence=model_confidence,
+            warning_signs=result.warning_signs,
+            risk_indicators=risk_indicators,
+            recommendations=result.recommendations,
+            explanation=result.explanation,
+            details=details,
+        )
+    except (OSError, sqlite3.Error):
+        logger.exception("Could not save scan history.")
+        raise HTTPException(
+            status_code=503,
+            detail="The scan completed but could not be saved to scan history.",
+        ) from None
+
+
+@app.post(
+    "/api/analyze-message",
+    response_model=AnalyzeMessageResponse,
+    summary="Classify a message with the SMS spam model",
+)
+def analyze_message(request: AnalyzeMessageRequest) -> AnalyzeMessageResponse:
+    """Classify SMS-like text; this does not verify that a message is safe."""
+    result = _analyze_message_text(request.message)
+    _record_scan(
+        scan_type="message",
+        result=result,
+        details={"character_count": len(request.message)},
+    )
+    return result
+
+
+@app.post(
+    "/api/analyze-screenshot",
+    response_model=AnalyzeMessageResponse,
+    summary="Analyze extracted screenshot text without retaining its contents",
+)
+def analyze_screenshot(request: AnalyzeScreenshotRequest) -> AnalyzeMessageResponse:
+    """Analyze client-extracted screenshot text; no image or text is retained."""
+    result = _analyze_message_text(request.extracted_text)
+    _record_scan(
+        scan_type="screenshot",
+        result=result,
+        details={"character_count": len(request.extracted_text)},
+    )
+    return result
+
+
 @app.post(
     "/api/analyze-url",
     response_model=AnalyzeURLResponse,
@@ -281,7 +367,55 @@ def analyze_message(request: AnalyzeMessageRequest) -> AnalyzeMessageResponse:
 def analyze_submitted_url(request: AnalyzeURLRequest) -> AnalyzeURLResponse:
     """Review URL structure locally; this endpoint never opens or verifies the URL."""
     analysis: URLAnalysis = analyze_url(request.url)
-    return AnalyzeURLResponse(**analysis)
+    result = AnalyzeURLResponse(**analysis)
+    _record_scan(
+        scan_type="url",
+        result=result,
+        details={
+            "character_count": len(request.url),
+            "scheme": urlsplit(request.url).scheme.lower(),
+        },
+        risk_indicators=result.risk_indicators,
+    )
+    return result
+
+
+@app.get("/api/scan-history")
+def retrieve_scan_history(
+    limit: int = 50,
+    offset: int = 0,
+    scan_type: Literal["message", "url", "screenshot"] | None = None,
+) -> dict[str, object]:
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100.")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be zero or greater.")
+    result = list_scans(limit=limit, offset=offset, scan_type=scan_type)
+    return {
+        "total": result["total"],
+        "limit": limit,
+        "offset": offset,
+        "scan_type": scan_type,
+        "items": result["items"],
+    }
+
+
+@app.get("/api/scan-history/{scan_id}")
+def retrieve_scan(scan_id: str) -> dict[str, object]:
+    scan = get_scan(scan_id)
+    if scan is None:
+        raise HTTPException(status_code=404, detail="Scan history record not found.")
+    return scan
+
+
+@app.delete("/api/scan-history")
+def clear_scan_history() -> dict[str, int]:
+    return {"deleted_count": delete_all_scans()}
+
+
+@app.get("/api/dashboard/summary")
+def retrieve_dashboard_summary() -> dict[str, object]:
+    return dashboard_summary()
 
 
 @app.post(
